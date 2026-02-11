@@ -38,6 +38,7 @@ BOX_CENTER_FALLBACK = (0.55, 0.0, 0.35)
 BOX_CENTER_Z_BIAS = 0.1
 BOX_SAFETY_RADIUS_XY = 0.20
 BOX_TOP_SAFE_Z_OFFSET = 0.20
+BOX_TOP_SAFE_Z_OFFSET_MOVE_ONLY = 0.00
 
 # ======================================================
 # IK
@@ -46,6 +47,7 @@ LEFT_EE_FRAME = "eepoint_l"
 RIGHT_EE_FRAME = "eepoint_r"
 IK_POS_TOL = 0.02
 ROTATE_IK_POS_TOL = 0.05
+MOVE_ONLY_IK_POS_TOL = 0.005
 IK_UPDATE_EVERY_N = 1
 
 # ======================================================
@@ -61,6 +63,7 @@ MOVE_ONLY_PHASES = {2}
 PHASE_COMPLETE_POS_EPS = 0.04
 PHASE_COMPLETE_ROTATE_POS_EPS = 0.07
 PHASE_COMPLETE_ORI_EPS_RAD = np.deg2rad(2.5)
+PHASE_COMPLETE_POS_EPS_MOVE_ONLY = 0.04
 DEBUG_PRINT_EVERY = 100
 
 # ======================================================
@@ -95,8 +98,8 @@ PHASE_POSES = {
         "right": {"pos": np.array([-0.1, -0.3, 0.3]), "quat": R_EE_GRIP_QUAT},
     },
     2: {
-        "left":  {"pos": np.array([-0.1,  0.2, 0.3]), "quat": L_EE_GRIP_QUAT},
-        "right": {"pos": np.array([-0.1, -0.2, 0.3]), "quat": R_EE_GRIP_QUAT},
+        "left":  {"pos": np.array([0.0,  0.2, 0.1]), "quat": L_EE_GRIP_QUAT},
+        "right": {"pos": np.array([0.0, -0.2, 0.1]), "quat": R_EE_GRIP_QUAT},
     },
 }
 PHASE_MAX = max(PHASE_POSES.keys())
@@ -172,7 +175,7 @@ def compute_phase_poses(phase, box_center):
     )
 
 
-def apply_box_clearance(target_pos, box_center):
+def apply_box_clearance(target_pos, box_center, top_safe_z_offset):
     p = target_pos.copy()
     delta_xy = p[:2] - box_center[:2]
     dist_xy = np.linalg.norm(delta_xy)
@@ -181,7 +184,7 @@ def apply_box_clearance(target_pos, box_center):
             delta_xy = np.array([1.0, 0.0], dtype=np.float32)
             dist_xy = 1.0
         p[:2] = box_center[:2] + (delta_xy / dist_xy) * BOX_SAFETY_RADIUS_XY
-    p[2] = max(p[2], box_center[2] + BOX_TOP_SAFE_Z_OFFSET)
+    p[2] = max(p[2], box_center[2] + top_safe_z_offset)
     return p
 
 
@@ -385,8 +388,11 @@ def main():
             dl_pos = lerp(dl_pos_start, dl_pos_end, t)
             dr_pos = lerp(dr_pos_start, dr_pos_end, t)
 
-        dl_pos = apply_box_clearance(dl_pos, box_center)
-        dr_pos = apply_box_clearance(dr_pos, box_center)
+        top_safe_z_offset = (
+            BOX_TOP_SAFE_Z_OFFSET_MOVE_ONLY if phase in MOVE_ONLY_PHASES else BOX_TOP_SAFE_Z_OFFSET
+        )
+        dl_pos = apply_box_clearance(dl_pos, box_center, top_safe_z_offset)
+        dr_pos = apply_box_clearance(dr_pos, box_center, top_safe_z_offset)
 
         # Keep move-only phases orientation-fixed and always align quaternion sign to start.
         if phase in MOVE_ONLY_PHASES:
@@ -412,54 +418,63 @@ def main():
             and ori_err_r < PHASE_COMPLETE_ORI_EPS_RAD
         )
 
-        # Phase-specific completion checks:
-        # - rotate phase: orientation to end, position around current trajectory point
-        # - other phases: position/orientation to phase end pose
+        # Completion checks:
+        # - rotate phase: evaluate against current trajectory point
+        # - move phases: evaluate against current point while moving, end pose after trajectory finishes
         if phase == ROTATE_PHASE:
+            pos_ref_l = dl_pos
+            pos_ref_r = dr_pos
             eps = PHASE_COMPLETE_ROTATE_POS_EPS
-            pos_err_l = np.linalg.norm(dl_pos - fk_l_pos)
-            pos_err_r = np.linalg.norm(dr_pos - fk_r_pos)
-            pos_ok = (pos_err_l < eps and pos_err_r < eps)
+        elif traj_step < traj_steps:
+            pos_ref_l = dl_pos
+            pos_ref_r = dr_pos
+            eps = PHASE_COMPLETE_POS_EPS
         else:
-            pos_err_l = np.linalg.norm(dl_pos_end - fk_l_pos)
-            pos_err_r = np.linalg.norm(dr_pos_end - fk_r_pos)
-            pos_ok = (
-                pos_err_l < PHASE_COMPLETE_POS_EPS
-                and pos_err_r < PHASE_COMPLETE_POS_EPS
-            )
+            pos_ref_l = dl_pos_end
+            pos_ref_r = dr_pos_end
+            eps = PHASE_COMPLETE_POS_EPS_MOVE_ONLY if phase in MOVE_ONLY_PHASES else PHASE_COMPLETE_POS_EPS
 
-        reach_eps = (
-            PHASE_COMPLETE_ROTATE_POS_EPS
-            if phase == ROTATE_PHASE
-            else PHASE_COMPLETE_POS_EPS
-        )
+        pos_err_l = np.linalg.norm(pos_ref_l - fk_l_pos)
+        pos_err_r = np.linalg.norm(pos_ref_r - fk_r_pos)
+        pos_ok = (pos_err_l < eps and pos_err_r < eps)
+
+        reach_eps = eps
         left_reached = pos_err_l < reach_eps and ori_err_l < PHASE_COMPLETE_ORI_EPS_RAD
         right_reached = pos_err_r < reach_eps and ori_err_r < PHASE_COMPLETE_ORI_EPS_RAD
 
         if traj_step >= traj_steps:
             if pos_ok and ori_ok:
-                phase_hold += 1
-                if phase_hold >= PHASE_HOLD_STEPS:
-                    phase = min(phase + 1, PHASE_MAX)
-                    phase_hold = 0
-                    fk_l_pos, fk_r_pos, _, _, fk_l_rot, fk_r_rot = get_fk_state(
-                        ik_left, ik_right
-                    )
-                    dl_pos_start = fk_l_pos
-                    dr_pos_start = fk_r_pos
-                    dl_quat_start = rotmat_to_quat_wxyz(fk_l_rot)
-                    dr_quat_start = rotmat_to_quat_wxyz(fk_r_rot)
-                    dl_pos_end, dl_quat_end, dr_pos_end, dr_quat_end = compute_phase_poses(
-                        phase, box_center
-                    )
-
-                    traj_step = 1
+                if phase < PHASE_MAX:
+                    phase_hold += 1
+                    if phase_hold >= PHASE_HOLD_STEPS:
+                        phase += 1
+                        phase_hold = 0
+                        fk_l_pos, fk_r_pos, _, _, fk_l_rot, fk_r_rot = get_fk_state(
+                            ik_left, ik_right
+                        )
+                        dl_pos_start = fk_l_pos
+                        dr_pos_start = fk_r_pos
+                        dl_quat_start = rotmat_to_quat_wxyz(fk_l_rot)
+                        dr_quat_start = rotmat_to_quat_wxyz(fk_r_rot)
+                        dl_pos_end, dl_quat_end, dr_pos_end, dr_quat_end = compute_phase_poses(
+                            phase, box_center
+                        )
+                        traj_step = 1
+                else:
+                    # Final phase: hold the end target without restarting the trajectory loop.
+                    phase_hold = PHASE_HOLD_STEPS
+                    traj_step = traj_steps
             else:
                 phase_hold = 0
         else:
             traj_step += 1
 
-        ik_pos_tol = ROTATE_IK_POS_TOL if phase == ROTATE_PHASE else IK_POS_TOL
+        if phase == ROTATE_PHASE:
+            ik_pos_tol = ROTATE_IK_POS_TOL
+        elif phase in MOVE_ONLY_PHASES:
+            ik_pos_tol = MOVE_ONLY_IK_POS_TOL
+        else:
+            ik_pos_tol = IK_POS_TOL
 
         action_l, ok_l = ik_left.compute_inverse_kinematics(
             target_position=dl_pos,
@@ -492,13 +507,17 @@ def main():
                 action_r, ok_r = action_r_fallback, True
 
         # Keep last valid per-arm IK to avoid arm drops when one step fails.
-        if phase != ROTATE_PHASE and left_reached:
+        # Reached-arm suppression is only used after trajectory finishes.
+        suppress_reached_action = (
+            phase != ROTATE_PHASE and phase < PHASE_MAX and traj_step >= traj_steps
+        )
+        if suppress_reached_action and left_reached:
             action_l = None
         elif ok_l and action_l is not None:
             last_action_l = action_l
         else:
             action_l = last_action_l
-        if phase != ROTATE_PHASE and right_reached:
+        if suppress_reached_action and right_reached:
             action_r = None
         elif ok_r and action_r is not None:
             last_action_r = action_r
@@ -507,7 +526,7 @@ def main():
 
         if step % DEBUG_PRINT_EVERY == 0:
             single_arm_catchup = (
-                phase != ROTATE_PHASE
+                suppress_reached_action
                 and ((left_reached and not right_reached) or (right_reached and not left_reached))
             )
             print("dl_pos", dl_pos)
@@ -543,7 +562,7 @@ def main():
         if merged is not None:
             curr = robot.get_joint_positions()
             single_arm_catchup = (
-                phase != ROTATE_PHASE
+                suppress_reached_action
                 and ((left_reached and not right_reached) or (right_reached and not left_reached))
             )
             if single_arm_catchup:
