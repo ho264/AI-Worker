@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""
+Isaac Sim IK demo (pose tracking):
+- Phase-based motion
+- Each phase defines a fixed pose (position + orientation)
+- Box pose via SingleXFormPrim
+- EE current via kinematic FK
+- Quaternion-based phase check (wxyz)
+"""
+
+import numpy as np
+from pathlib import Path
+from isaacsim.simulation_app import SimulationApp
+
+# ======================================================
+# Simulation
+# ======================================================
+simulation_app = SimulationApp({"headless": False})
+
+from isaacsim.core.prims import SingleXFormPrim
+from isaacsim.core.utils.types import ArticulationAction
+
+# ======================================================
+# Paths
+# ======================================================
+USD_PATH = "/home/youngho/git/ai-worker/ffw_description/temp.usd"
+LULA_DESC_PATH = "/home/youngho/git/ai-worker/ffw_description/sg2.yaml"
+ROBOT_URDF_PATH = "/home/youngho/git/ai-worker/ffw_description/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
+
+# ======================================================
+# Box
+# ======================================================
+BOX_ROOT_PATH = "/World/Box"
+BOX_CENTER_FALLBACK = (0.55, 0.0, 0.35)
+BOX_CENTER_Z_BIAS = 0.1
+
+# ======================================================
+# IK
+# ======================================================
+LEFT_EE_FRAME = "eepoint_l"
+RIGHT_EE_FRAME = "eepoint_r"
+IK_POS_TOL = 0.02
+IK_UPDATE_EVERY_N = 1
+
+# ======================================================
+# Phase config
+# ======================================================
+PHASE_MAX = 2
+PHASE_HOLD_STEPS = 10
+HOLD_EPS = 0.1
+ORI_EPS_RAD = np.deg2rad(5.0)
+
+# ======================================================
+# Trajectory config
+# ======================================================
+TRAJ_DURATION_SEC = 20.0
+ROTATE_SPLITS = 10.0
+
+JOINT_JUMP_THRESH = 0.5
+
+# ======================================================
+# Orientation (wxyz)
+# ======================================================
+L_EE_APPROACH_QUAT = np.array([0.5, 0.5, -0.5, 0.5], dtype=np.float32)
+L_EE_GRIP_QUAT     = np.array([0.0, 0.0, -0.7071068, 0.7071068], dtype=np.float32)
+R_EE_APPROACH_QUAT = np.array([0.5, -0.5, -0.5, -0.5], dtype=np.float32)
+R_EE_GRIP_QUAT     = np.array([0.7071068, -0.7071068, 0.0, 0.0], dtype=np.float32)
+
+PHASE_POSES = {
+    0: {
+        "left":  {"pos": np.array([-0.1,  0.3, 0.3]), "quat": L_EE_APPROACH_QUAT},
+        "right": {"pos": np.array([-0.1, -0.3, 0.3]), "quat": R_EE_APPROACH_QUAT},
+    },
+    1: {
+        "left":  {"pos": np.array([-0.1,  0.3, 0.3]), "quat": L_EE_GRIP_QUAT},
+        "right": {"pos": np.array([-0.1, -0.3, 0.3]), "quat": R_EE_GRIP_QUAT},
+    },
+    2: {
+        "left":  {"pos": np.array([-0.1,  0.2, 0.3]), "quat": L_EE_GRIP_QUAT},
+        "right": {"pos": np.array([-0.1, -0.2, 0.3]), "quat": R_EE_GRIP_QUAT},
+    },
+}
+
+LEFT_ARM_JOINT_NAMES  = [f"arm_l_joint{i}" for i in range(1, 8)]
+RIGHT_ARM_JOINT_NAMES = [f"arm_r_joint{i}" for i in range(1, 8)]
+
+# ======================================================
+# Utils
+# ======================================================
+def quat_angle_error_wxyz(q1, q2):
+    q1 = q1 / np.linalg.norm(q1)
+    q2 = q2 / np.linalg.norm(q2)
+    dot = np.clip(abs(np.dot(q1, q2)), -1.0, 1.0)
+    return 2.0 * np.arccos(dot)
+
+
+def rotmat_to_quat_wxyz(R):
+    """
+    Convert rotation matrix to quaternion (w, x, y, z)
+    """
+    m00, m01, m02 = R[0]
+    m10, m11, m12 = R[1]
+    m20, m21, m22 = R[2]
+
+    trace = m00 + m11 + m22
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m21 - m12) * s
+        y = (m02 - m20) * s
+        z = (m10 - m01) * s
+    elif m00 > m11 and m00 > m22:
+        s = 2.0 * np.sqrt(1.0 + m00 - m11 - m22)
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = 2.0 * np.sqrt(1.0 + m11 - m00 - m22)
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m22 - m00 - m11)
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+
+    q = np.array([w, x, y, z], dtype=np.float32)
+    return q / np.linalg.norm(q)
+
+
+def find_articulation_root():
+    import omni.usd
+    from pxr import UsdPhysics
+    stage = omni.usd.get_context().get_stage()
+    for prim in stage.Traverse():
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            return str(prim.GetPath())
+    return None
+
+
+def compute_phase_poses(phase, box_center):
+    cfg = PHASE_POSES[phase]
+    return (
+        box_center + cfg["left"]["pos"],
+        cfg["left"]["quat"],
+        box_center + cfg["right"]["pos"],
+        cfg["right"]["quat"],
+    )
+
+
+def merge_lr_actions_by_dof(robot, action_l, action_r):
+    joint_indices, joint_positions = [], []
+
+    def extract(action, joint_names):
+        if action is None:
+            return
+        ik_map = {int(i): p for i, p in zip(action.joint_indices, action.joint_positions)}
+        for name in joint_names:
+            dof = robot.get_dof_index(name)
+            if dof in ik_map:
+                joint_indices.append(dof)
+                joint_positions.append(ik_map[dof])
+
+    extract(action_l, LEFT_ARM_JOINT_NAMES)
+    extract(action_r, RIGHT_ARM_JOINT_NAMES)
+
+    if not joint_indices:
+        return None
+
+    return ArticulationAction(
+        joint_indices=np.array(joint_indices, dtype=np.int32),
+        joint_positions=np.array(joint_positions, dtype=np.float32),
+    )
+
+def lerp(a, b, t):
+    return (1.0 - t) * a + t * b
+
+# 회전 보간 (쿼터니언 slerp)
+def slerp_quat_wxyz(q0, q1, t):
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    dot = np.dot(q0, q1)
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = np.clip(dot, -1.0, 1.0)
+    if dot > 0.9995:
+        return (q0 + t * (q1 - q0)) / np.linalg.norm(q0 + t * (q1 - q0))
+    theta_0 = np.arccos(dot)
+    sin_theta_0 = np.sin(theta_0)
+    theta = theta_0 * t
+    sin_theta = np.sin(theta)
+    s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    return s0 * q0 + s1 * q1
+
+# 회전 보간 (분할 slerp)
+def slerp_quat_wxyz_split(q0, q1, t, splits=2):
+    if splits <= 1:
+        return slerp_quat_wxyz(q0, q1, t)
+    mid = slerp_quat_wxyz(q0, q1, 0.5)
+    if t < 0.5:
+        return slerp_quat_wxyz(q0, mid, t * 2.0)
+    return slerp_quat_wxyz(mid, q1, (t - 0.5) * 2.0)
+
+# 관절 변화량 제한
+def clamp_joint_step(curr, target, max_step):
+    delta = target - curr
+    delta = np.clip(delta, -max_step, max_step)
+    return curr + delta
+
+
+# ======================================================
+# Main
+# ======================================================
+def main():
+    usd_path = Path(USD_PATH)
+    if not usd_path.is_file():
+        print("USD not found")
+        return
+
+    from isaacsim.core.api.world import World
+    from isaacsim.core.utils.stage import open_stage
+    import omni.timeline
+    from isaacsim.core.api.robots import Robot
+    from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver
+    from isaacsim.robot_motion.motion_generation.lula.kinematics import LulaKinematicsSolver
+
+    open_stage(str(usd_path))
+    world = World(
+        stage_units_in_meters=1.0,
+        physics_dt=1.0 / 60.0,
+        rendering_dt=1.0 / 60.0,
+    )
+    omni.timeline.get_timeline_interface().play()
+
+    for _ in range(10):
+        world.step(render=True)
+
+    robot = Robot(find_articulation_root(), name="sg2")
+    world.scene.add(robot)
+    world.reset()
+    robot.initialize()
+
+    kin = LulaKinematicsSolver(
+        robot_description_path=LULA_DESC_PATH,
+        urdf_path=ROBOT_URDF_PATH,
+    )
+
+    base_pos, base_quat = robot.get_world_pose()
+    kin.set_robot_base_pose(base_pos, base_quat)
+
+    ik_left  = ArticulationKinematicsSolver(robot, kin, LEFT_EE_FRAME)
+    ik_right = ArticulationKinematicsSolver(robot, kin, RIGHT_EE_FRAME)
+
+    box_prim = SingleXFormPrim(prim_path=BOX_ROOT_PATH)
+
+    phase, phase_hold, step = 0, 0, 0
+    traj_step = 0
+    traj_steps = max(1, int(TRAJ_DURATION_SEC / (1.0 / 60.0)))
+
+    # Initialize trajectory start/end
+    box_pos, _ = box_prim.get_world_pose()
+    box_center = np.array(box_pos) if box_pos is not None else np.array(BOX_CENTER_FALLBACK)
+    box_center[2] += BOX_CENTER_Z_BIAS
+    dl_pos_end, dl_quat_end, dr_pos_end, dr_quat_end = compute_phase_poses(phase, box_center)
+
+    fk_l_pos, fk_l_rot = ik_left.compute_end_effector_pose()
+    fk_r_pos, fk_r_rot = ik_right.compute_end_effector_pose()
+    curr_l_quat = rotmat_to_quat_wxyz(fk_l_rot)
+    curr_r_quat = rotmat_to_quat_wxyz(fk_r_rot)
+
+    dl_pos_start = fk_l_pos
+    dl_quat_start = curr_l_quat
+    dr_pos_start = fk_r_pos
+    dr_quat_start = curr_r_quat
+
+    prev_joint_positions = None
+
+    while simulation_app.is_running():
+        world.step(render=True)
+
+        if step % IK_UPDATE_EVERY_N != 0:
+            step += 1
+            continue
+
+        box_pos, _ = box_prim.get_world_pose()
+        box_center = np.array(box_pos) if box_pos is not None else np.array(BOX_CENTER_FALLBACK)
+        box_center[2] += BOX_CENTER_Z_BIAS
+
+        # FK for current state
+        fk_l_pos, fk_l_rot = ik_left.compute_end_effector_pose()
+        fk_r_pos, fk_r_rot = ik_right.compute_end_effector_pose()
+        curr_l_quat = rotmat_to_quat_wxyz(fk_l_rot)
+        curr_r_quat = rotmat_to_quat_wxyz(fk_r_rot)
+
+        # Trajectory target for current step
+        t = min(1.0, traj_step / traj_steps)
+        dl_pos = lerp(dl_pos_start, dl_pos_end, t)
+        dr_pos = lerp(dr_pos_start, dr_pos_end, t)
+        dl_quat = slerp_quat_wxyz_split(dl_quat_start, dl_quat_end, t, splits=ROTATE_SPLITS)
+        dr_quat = slerp_quat_wxyz_split(dr_quat_start, dr_quat_end, t, splits=ROTATE_SPLITS)
+
+        # 기존 pos_ok 블록을 이걸로 교체
+        pos_ok = (
+            np.linalg.norm(dl_pos_end - fk_l_pos) < HOLD_EPS
+            and np.linalg.norm(dr_pos_end - fk_r_pos) < HOLD_EPS
+        )
+
+
+        ori_ok = (
+            quat_angle_error_wxyz(dl_quat_end, curr_l_quat) < ORI_EPS_RAD
+            and quat_angle_error_wxyz(dr_quat_end, curr_r_quat) < ORI_EPS_RAD
+        )
+
+        if traj_step >= traj_steps:
+            if pos_ok and ori_ok:
+                phase_hold += 1
+                if phase_hold >= PHASE_HOLD_STEPS:
+                    phase = min(phase + 1, PHASE_MAX)
+                    phase_hold = 0
+                    fk_l_pos, fk_l_rot = ik_left.compute_end_effector_pose()
+                    fk_r_pos, fk_r_rot = ik_right.compute_end_effector_pose()
+                    dl_pos_start = fk_l_pos
+                    dr_pos_start = fk_r_pos
+                    dl_quat_start = rotmat_to_quat_wxyz(fk_l_rot)
+                    dr_quat_start = rotmat_to_quat_wxyz(fk_r_rot)
+                    dl_pos_end, dl_quat_end, dr_pos_end, dr_quat_end = compute_phase_poses(
+                        phase, box_center
+                    )
+
+                    traj_step = 1
+            else:
+                phase_hold = 0
+        else:
+            traj_step += 1
+
+        action_l, ok_l = ik_left.compute_inverse_kinematics(
+            target_position=dl_pos,
+            target_orientation=dl_quat,
+            position_tolerance=IK_POS_TOL,
+        )
+        action_r, ok_r = ik_right.compute_inverse_kinematics(
+            target_position=dr_pos,
+            target_orientation=dr_quat,
+            position_tolerance=IK_POS_TOL,
+        )
+
+        if step % 100 == 0:
+            print("dl_pos",dl_pos)
+            print("dl_quat",dl_quat)
+            print("dr_pos",dr_pos)
+            print("dr_quat",dr_quat)
+            print("ok_l",ok_l)
+            print("ok_r",ok_r)
+            print("fk_l_pos",fk_l_pos)
+            print("fk_r_pos",fk_r_pos)
+            print("curr_l_quat",curr_l_quat)
+            print("curr_r_quat",curr_r_quat)
+            print("phase:", phase)
+            print(
+                "traj_step", traj_step,
+                "pos_ok", pos_ok,
+                "ori_ok", ori_ok,
+                "ori_err_l", quat_angle_error_wxyz(dl_quat_end, curr_l_quat),
+                "ori_err_r", quat_angle_error_wxyz(dr_quat_end, curr_r_quat),
+            )
+
+        merged = merge_lr_actions_by_dof(
+            robot,
+            action_l if ok_l else None,
+            action_r if ok_r else None,
+        )
+
+        if merged is not None:
+            curr = robot.get_joint_positions()
+            limited = clamp_joint_step(
+                curr[merged.joint_indices],
+                merged.joint_positions,
+                max_step=0.005
+            )
+
+            if prev_joint_positions is not None:
+                delta = np.abs(limited - prev_joint_positions[merged.joint_indices])
+                if np.any(delta > JOINT_JUMP_THRESH):
+                    # 점프 감지 시 이전 값 유지
+                    limited = prev_joint_positions[merged.joint_indices]
+
+            merged = ArticulationAction(
+                joint_indices=merged.joint_indices,
+                joint_positions=limited.astype(np.float32)
+            )
+            robot.apply_action(merged)
+            prev_joint_positions = curr
+
+        step += 1
+
+    simulation_app.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -386,7 +386,7 @@
       <!-- the mesh origin is at front plate in between the two infrared camera axes -->
       <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0.0038 -0.009 0"/>
       <geometry>
-        <mesh filename="file:///root/ros2_ws/install/realsense2_description/share/realsense2_description/meshes/d405.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="file:///home/youngho/git/ai-worker/ffw_description/meshes/common/follower/zedm.stl" scale="0.001 0.001 0.001"/>
       </geometry>
       <material name="aluminum"/>
     </visual>
@@ -629,7 +629,7 @@
       <!-- the mesh origin is at front plate in between the two infrared camera axes -->
       <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0.0038 -0.009 0"/>
       <geometry>
-        <mesh filename="file:///root/ros2_ws/install/realsense2_description/share/realsense2_description/meshes/d405.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="file:///home/youngho/git/ai-worker/ffw_description/meshes/common/follower/zedm.stl" scale="0.001 0.001 0.001"/>
       </geometry>
       <material name="aluminum"/>
     </visual>
@@ -674,6 +674,13 @@
       <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
     </inertial>
   </link>
+  <!-- eepoint_l -->
+  <link name="eepoint_l"/>
+  <joint name="eepoint_l_joint" type="fixed">
+    <parent link="gripper_l_rh_p12_rn_base"/>
+    <child link="eepoint_l"/>
+    <origin xyz="0 0 0.11" rpy="0 0 0"/>
+  </joint>
   <!-- Joint -->
   <joint name="gripper_l_joint1" type="revolute">
     <parent link="gripper_l_rh_p12_rn_base"/>
@@ -833,6 +840,13 @@
       <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
     </inertial>
   </link>
+  <!-- eepoint_r -->
+  <link name="eepoint_r"/>
+  <joint name="eepoint_r_joint" type="fixed">
+    <parent link="gripper_r_rh_p12_rn_base"/>
+    <child link="eepoint_r"/>
+    <origin xyz="0 0 0.11" rpy="0 0 0"/>
+  </joint>
   <!-- Joint -->
   <joint name="gripper_r_joint1" type="revolute">
     <parent link="gripper_r_rh_p12_rn_base"/>
