@@ -6,6 +6,9 @@ Isaac Sim IK demo (pose tracking):
 - Box pose via SingleXFormPrim
 - EE current via kinematic FK
 - Quaternion-based phase check (wxyz)
+- Target quaternion continuity + rate limiting
+- Per-joint step limiting
+- Per-phase completion checks
 """
 
 import numpy as np
@@ -33,6 +36,8 @@ ROBOT_URDF_PATH = "/home/youngho/git/ai-worker/ffw_description/urdf/ffw_sg2_rev1
 BOX_ROOT_PATH = "/World/Box"
 BOX_CENTER_FALLBACK = (0.55, 0.0, 0.35)
 BOX_CENTER_Z_BIAS = 0.1
+BOX_SAFETY_RADIUS_XY = 0.20
+BOX_TOP_SAFE_Z_OFFSET = 0.20
 
 # ======================================================
 # IK
@@ -40,23 +45,37 @@ BOX_CENTER_Z_BIAS = 0.1
 LEFT_EE_FRAME = "eepoint_l"
 RIGHT_EE_FRAME = "eepoint_r"
 IK_POS_TOL = 0.02
+ROTATE_IK_POS_TOL = 0.05
 IK_UPDATE_EVERY_N = 1
 
 # ======================================================
 # Phase config
 # ======================================================
-PHASE_MAX = 2
-PHASE_HOLD_STEPS = 10
+PHASE_HOLD_STEPS = 100
 HOLD_EPS = 0.1
 ORI_EPS_RAD = np.deg2rad(5.0)
+ROTATE_PHASE = 1
+LOCK_POSITION_DURING_ROTATE = True
+ROTATE_POS_EPS = 0.12
+MOVE_ONLY_PHASES = {2}
+PHASE_COMPLETE_POS_EPS = 0.04
+PHASE_COMPLETE_ROTATE_POS_EPS = 0.07
+PHASE_COMPLETE_ORI_EPS_RAD = np.deg2rad(2.5)
+DEBUG_PRINT_EVERY = 100
 
 # ======================================================
 # Trajectory config
 # ======================================================
-TRAJ_DURATION_SEC = 20.0
-ROTATE_SPLITS = 10.0
+TRAJ_DURATION_SEC = 28.0
+ROTATE_SPLITS = 5
 
-JOINT_JUMP_THRESH = 0.5
+MAX_TARGET_ROT_STEP_RAD = np.deg2rad(1.0)
+MAX_JOINT_STEP = 0.0035
+MAX_JOINT_STEP_ROTATE = 0.0025
+CMD_SMOOTHING_ALPHA = 0.28
+CMD_SMOOTHING_ALPHA_ROTATE = 0.20
+MAX_JOINT_STEP_SINGLE_ARM = 0.006
+CMD_SMOOTHING_ALPHA_SINGLE_ARM = 0.45
 
 # ======================================================
 # Orientation (wxyz)
@@ -80,6 +99,7 @@ PHASE_POSES = {
         "right": {"pos": np.array([-0.1, -0.2, 0.3]), "quat": R_EE_GRIP_QUAT},
     },
 }
+PHASE_MAX = max(PHASE_POSES.keys())
 
 LEFT_ARM_JOINT_NAMES  = [f"arm_l_joint{i}" for i in range(1, 8)]
 RIGHT_ARM_JOINT_NAMES = [f"arm_r_joint{i}" for i in range(1, 8)]
@@ -152,6 +172,34 @@ def compute_phase_poses(phase, box_center):
     )
 
 
+def apply_box_clearance(target_pos, box_center):
+    p = target_pos.copy()
+    delta_xy = p[:2] - box_center[:2]
+    dist_xy = np.linalg.norm(delta_xy)
+    if dist_xy < BOX_SAFETY_RADIUS_XY:
+        if dist_xy < 1e-8:
+            delta_xy = np.array([1.0, 0.0], dtype=np.float32)
+            dist_xy = 1.0
+        p[:2] = box_center[:2] + (delta_xy / dist_xy) * BOX_SAFETY_RADIUS_XY
+    p[2] = max(p[2], box_center[2] + BOX_TOP_SAFE_Z_OFFSET)
+    return p
+
+
+def get_box_center(box_prim):
+    box_pos, _ = box_prim.get_world_pose()
+    box_center = np.array(box_pos) if box_pos is not None else np.array(BOX_CENTER_FALLBACK)
+    box_center[2] += BOX_CENTER_Z_BIAS
+    return box_center
+
+
+def get_fk_state(ik_left, ik_right):
+    fk_l_pos, fk_l_rot = ik_left.compute_end_effector_pose()
+    fk_r_pos, fk_r_rot = ik_right.compute_end_effector_pose()
+    curr_l_quat = rotmat_to_quat_wxyz(fk_l_rot)
+    curr_r_quat = rotmat_to_quat_wxyz(fk_r_rot)
+    return fk_l_pos, fk_r_pos, curr_l_quat, curr_r_quat, fk_l_rot, fk_r_rot
+
+
 def merge_lr_actions_by_dof(robot, action_l, action_r):
     joint_indices, joint_positions = [], []
 
@@ -200,18 +248,52 @@ def slerp_quat_wxyz(q0, q1, t):
 
 # 회전 보간 (분할 slerp)
 def slerp_quat_wxyz_split(q0, q1, t, splits=2):
+    splits = max(1, int(splits))
     if splits <= 1:
         return slerp_quat_wxyz(q0, q1, t)
-    mid = slerp_quat_wxyz(q0, q1, 0.5)
-    if t < 0.5:
-        return slerp_quat_wxyz(q0, mid, t * 2.0)
-    return slerp_quat_wxyz(mid, q1, (t - 0.5) * 2.0)
+    t = np.clip(t, 0.0, 1.0)
+    seg = min(splits - 1, int(t * splits))
+    t0 = seg / splits
+    t1 = (seg + 1) / splits
+    local_t = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+    q_start = slerp_quat_wxyz(q0, q1, t0)
+    q_end = slerp_quat_wxyz(q0, q1, t1)
+    return slerp_quat_wxyz(q_start, q_end, local_t)
+
+
+def clamp_quat_target_step(prev_q, target_q, max_step_rad):
+    target_q = target_q / np.linalg.norm(target_q)
+    if prev_q is None:
+        return target_q
+    prev_q = prev_q / np.linalg.norm(prev_q)
+    if np.dot(prev_q, target_q) < 0.0:
+        target_q = -target_q
+    ang = quat_angle_error_wxyz(prev_q, target_q)
+    if ang <= max_step_rad:
+        return target_q
+    t = max_step_rad / max(ang, 1e-8)
+    return slerp_quat_wxyz(prev_q, target_q, t)
+
+
+def align_quat_sign(target_q, ref_q):
+    if np.dot(target_q, ref_q) < 0.0:
+        return -target_q
+    return target_q
 
 # 관절 변화량 제한
 def clamp_joint_step(curr, target, max_step):
     delta = target - curr
     delta = np.clip(delta, -max_step, max_step)
     return curr + delta
+
+
+def smooth_joint_targets(indices, curr, target, prev_cmd_map, alpha):
+    smoothed = target.copy()
+    for k, dof in enumerate(indices):
+        dof_i = int(dof)
+        prev_cmd = prev_cmd_map.get(dof_i, float(curr[dof_i]))
+        smoothed[k] = prev_cmd + alpha * (target[k] - prev_cmd)
+    return smoothed
 
 
 # ======================================================
@@ -264,22 +346,23 @@ def main():
     traj_steps = max(1, int(TRAJ_DURATION_SEC / (1.0 / 60.0)))
 
     # Initialize trajectory start/end
-    box_pos, _ = box_prim.get_world_pose()
-    box_center = np.array(box_pos) if box_pos is not None else np.array(BOX_CENTER_FALLBACK)
-    box_center[2] += BOX_CENTER_Z_BIAS
+    box_center = get_box_center(box_prim)
     dl_pos_end, dl_quat_end, dr_pos_end, dr_quat_end = compute_phase_poses(phase, box_center)
 
-    fk_l_pos, fk_l_rot = ik_left.compute_end_effector_pose()
-    fk_r_pos, fk_r_rot = ik_right.compute_end_effector_pose()
-    curr_l_quat = rotmat_to_quat_wxyz(fk_l_rot)
-    curr_r_quat = rotmat_to_quat_wxyz(fk_r_rot)
+    fk_l_pos, fk_r_pos, curr_l_quat, curr_r_quat, fk_l_rot, fk_r_rot = get_fk_state(
+        ik_left, ik_right
+    )
 
     dl_pos_start = fk_l_pos
     dl_quat_start = curr_l_quat
     dr_pos_start = fk_r_pos
     dr_quat_start = curr_r_quat
 
-    prev_joint_positions = None
+    prev_target_l_quat = None
+    prev_target_r_quat = None
+    last_action_l = None
+    last_action_r = None
+    prev_cmd_map = {}
 
     while simulation_app.is_running():
         world.step(render=True)
@@ -288,34 +371,70 @@ def main():
             step += 1
             continue
 
-        box_pos, _ = box_prim.get_world_pose()
-        box_center = np.array(box_pos) if box_pos is not None else np.array(BOX_CENTER_FALLBACK)
-        box_center[2] += BOX_CENTER_Z_BIAS
-
-        # FK for current state
-        fk_l_pos, fk_l_rot = ik_left.compute_end_effector_pose()
-        fk_r_pos, fk_r_rot = ik_right.compute_end_effector_pose()
-        curr_l_quat = rotmat_to_quat_wxyz(fk_l_rot)
-        curr_r_quat = rotmat_to_quat_wxyz(fk_r_rot)
+        box_center = get_box_center(box_prim)
+        fk_l_pos, fk_r_pos, curr_l_quat, curr_r_quat, fk_l_rot, fk_r_rot = get_fk_state(
+            ik_left, ik_right
+        )
 
         # Trajectory target for current step
         t = min(1.0, traj_step / traj_steps)
-        dl_pos = lerp(dl_pos_start, dl_pos_end, t)
-        dr_pos = lerp(dr_pos_start, dr_pos_end, t)
-        dl_quat = slerp_quat_wxyz_split(dl_quat_start, dl_quat_end, t, splits=ROTATE_SPLITS)
-        dr_quat = slerp_quat_wxyz_split(dr_quat_start, dr_quat_end, t, splits=ROTATE_SPLITS)
+        if phase == ROTATE_PHASE and LOCK_POSITION_DURING_ROTATE:
+            dl_pos = dl_pos_start
+            dr_pos = dr_pos_start
+        else:
+            dl_pos = lerp(dl_pos_start, dl_pos_end, t)
+            dr_pos = lerp(dr_pos_start, dr_pos_end, t)
 
-        # 기존 pos_ok 블록을 이걸로 교체
-        pos_ok = (
-            np.linalg.norm(dl_pos_end - fk_l_pos) < HOLD_EPS
-            and np.linalg.norm(dr_pos_end - fk_r_pos) < HOLD_EPS
-        )
+        dl_pos = apply_box_clearance(dl_pos, box_center)
+        dr_pos = apply_box_clearance(dr_pos, box_center)
 
+        # Keep move-only phases orientation-fixed and always align quaternion sign to start.
+        if phase in MOVE_ONLY_PHASES:
+            dl_quat_goal = dl_quat_start
+            dr_quat_goal = dr_quat_start
+        else:
+            dl_quat_goal = align_quat_sign(dl_quat_end, dl_quat_start)
+            dr_quat_goal = align_quat_sign(dr_quat_end, dr_quat_start)
 
+        dl_quat = slerp_quat_wxyz_split(dl_quat_start, dl_quat_goal, t, splits=ROTATE_SPLITS)
+        dr_quat = slerp_quat_wxyz_split(dr_quat_start, dr_quat_goal, t, splits=ROTATE_SPLITS)
+
+        # Keep target orientation continuous and rate-limited.
+        dl_quat = clamp_quat_target_step(prev_target_l_quat, dl_quat, MAX_TARGET_ROT_STEP_RAD)
+        dr_quat = clamp_quat_target_step(prev_target_r_quat, dr_quat, MAX_TARGET_ROT_STEP_RAD)
+        prev_target_l_quat = dl_quat.copy()
+        prev_target_r_quat = dr_quat.copy()
+
+        ori_err_l = quat_angle_error_wxyz(dl_quat_goal, curr_l_quat)
+        ori_err_r = quat_angle_error_wxyz(dr_quat_goal, curr_r_quat)
         ori_ok = (
-            quat_angle_error_wxyz(dl_quat_end, curr_l_quat) < ORI_EPS_RAD
-            and quat_angle_error_wxyz(dr_quat_end, curr_r_quat) < ORI_EPS_RAD
+            ori_err_l < PHASE_COMPLETE_ORI_EPS_RAD
+            and ori_err_r < PHASE_COMPLETE_ORI_EPS_RAD
         )
+
+        # Phase-specific completion checks:
+        # - rotate phase: orientation to end, position around current trajectory point
+        # - other phases: position/orientation to phase end pose
+        if phase == ROTATE_PHASE:
+            eps = PHASE_COMPLETE_ROTATE_POS_EPS
+            pos_err_l = np.linalg.norm(dl_pos - fk_l_pos)
+            pos_err_r = np.linalg.norm(dr_pos - fk_r_pos)
+            pos_ok = (pos_err_l < eps and pos_err_r < eps)
+        else:
+            pos_err_l = np.linalg.norm(dl_pos_end - fk_l_pos)
+            pos_err_r = np.linalg.norm(dr_pos_end - fk_r_pos)
+            pos_ok = (
+                pos_err_l < PHASE_COMPLETE_POS_EPS
+                and pos_err_r < PHASE_COMPLETE_POS_EPS
+            )
+
+        reach_eps = (
+            PHASE_COMPLETE_ROTATE_POS_EPS
+            if phase == ROTATE_PHASE
+            else PHASE_COMPLETE_POS_EPS
+        )
+        left_reached = pos_err_l < reach_eps and ori_err_l < PHASE_COMPLETE_ORI_EPS_RAD
+        right_reached = pos_err_r < reach_eps and ori_err_r < PHASE_COMPLETE_ORI_EPS_RAD
 
         if traj_step >= traj_steps:
             if pos_ok and ori_ok:
@@ -323,8 +442,9 @@ def main():
                 if phase_hold >= PHASE_HOLD_STEPS:
                     phase = min(phase + 1, PHASE_MAX)
                     phase_hold = 0
-                    fk_l_pos, fk_l_rot = ik_left.compute_end_effector_pose()
-                    fk_r_pos, fk_r_rot = ik_right.compute_end_effector_pose()
+                    fk_l_pos, fk_r_pos, _, _, fk_l_rot, fk_r_rot = get_fk_state(
+                        ik_left, ik_right
+                    )
                     dl_pos_start = fk_l_pos
                     dr_pos_start = fk_r_pos
                     dl_quat_start = rotmat_to_quat_wxyz(fk_l_rot)
@@ -339,63 +459,118 @@ def main():
         else:
             traj_step += 1
 
+        ik_pos_tol = ROTATE_IK_POS_TOL if phase == ROTATE_PHASE else IK_POS_TOL
+
         action_l, ok_l = ik_left.compute_inverse_kinematics(
             target_position=dl_pos,
             target_orientation=dl_quat,
-            position_tolerance=IK_POS_TOL,
+            position_tolerance=ik_pos_tol,
         )
         action_r, ok_r = ik_right.compute_inverse_kinematics(
             target_position=dr_pos,
             target_orientation=dr_quat,
-            position_tolerance=IK_POS_TOL,
+            position_tolerance=ik_pos_tol,
         )
 
-        if step % 100 == 0:
-            print("dl_pos",dl_pos)
-            print("dl_quat",dl_quat)
-            print("dr_pos",dr_pos)
-            print("dr_quat",dr_quat)
-            print("ok_l",ok_l)
-            print("ok_r",ok_r)
-            print("fk_l_pos",fk_l_pos)
-            print("fk_r_pos",fk_r_pos)
-            print("curr_l_quat",curr_l_quat)
-            print("curr_r_quat",curr_r_quat)
+        # If orientation-constrained IK fails, retry with current orientation
+        # to keep Cartesian position progress instead of stalling.
+        if not ok_l:
+            action_l_fallback, ok_l_fallback = ik_left.compute_inverse_kinematics(
+                target_position=dl_pos,
+                target_orientation=curr_l_quat,
+                position_tolerance=ik_pos_tol,
+            )
+            if ok_l_fallback and action_l_fallback is not None:
+                action_l, ok_l = action_l_fallback, True
+        if not ok_r:
+            action_r_fallback, ok_r_fallback = ik_right.compute_inverse_kinematics(
+                target_position=dr_pos,
+                target_orientation=curr_r_quat,
+                position_tolerance=ik_pos_tol,
+            )
+            if ok_r_fallback and action_r_fallback is not None:
+                action_r, ok_r = action_r_fallback, True
+
+        # Keep last valid per-arm IK to avoid arm drops when one step fails.
+        if phase != ROTATE_PHASE and left_reached:
+            action_l = None
+        elif ok_l and action_l is not None:
+            last_action_l = action_l
+        else:
+            action_l = last_action_l
+        if phase != ROTATE_PHASE and right_reached:
+            action_r = None
+        elif ok_r and action_r is not None:
+            last_action_r = action_r
+        else:
+            action_r = last_action_r
+
+        if step % DEBUG_PRINT_EVERY == 0:
+            single_arm_catchup = (
+                phase != ROTATE_PHASE
+                and ((left_reached and not right_reached) or (right_reached and not left_reached))
+            )
+            print("dl_pos", dl_pos)
+            print("dl_quat", dl_quat)
+            print("dr_pos", dr_pos)
+            print("dr_quat", dr_quat)
+            print("ok_l", ok_l)
+            print("ok_r", ok_r)
+            print("fk_l_pos", fk_l_pos)
+            print("fk_r_pos", fk_r_pos)
+            print("curr_l_quat", curr_l_quat)
+            print("curr_r_quat", curr_r_quat)
             print("phase:", phase)
             print(
                 "traj_step", traj_step,
                 "pos_ok", pos_ok,
                 "ori_ok", ori_ok,
-                "ori_err_l", quat_angle_error_wxyz(dl_quat_end, curr_l_quat),
-                "ori_err_r", quat_angle_error_wxyz(dr_quat_end, curr_r_quat),
+                "pos_err_l", pos_err_l,
+                "pos_err_r", pos_err_r,
+                "ori_err_l", ori_err_l,
+                "ori_err_r", ori_err_r,
+                "left_reached", left_reached,
+                "right_reached", right_reached,
+                "single_arm_catchup", single_arm_catchup,
             )
 
         merged = merge_lr_actions_by_dof(
             robot,
-            action_l if ok_l else None,
-            action_r if ok_r else None,
+            action_l,
+            action_r,
         )
 
         if merged is not None:
             curr = robot.get_joint_positions()
+            single_arm_catchup = (
+                phase != ROTATE_PHASE
+                and ((left_reached and not right_reached) or (right_reached and not left_reached))
+            )
+            if single_arm_catchup:
+                max_step = MAX_JOINT_STEP_SINGLE_ARM
+                cmd_alpha = CMD_SMOOTHING_ALPHA_SINGLE_ARM
+            else:
+                max_step = MAX_JOINT_STEP_ROTATE if phase == ROTATE_PHASE else MAX_JOINT_STEP
+                cmd_alpha = CMD_SMOOTHING_ALPHA_ROTATE if phase == ROTATE_PHASE else CMD_SMOOTHING_ALPHA
             limited = clamp_joint_step(
                 curr[merged.joint_indices],
                 merged.joint_positions,
-                max_step=0.005
+                max_step=max_step
             )
-
-            if prev_joint_positions is not None:
-                delta = np.abs(limited - prev_joint_positions[merged.joint_indices])
-                if np.any(delta > JOINT_JUMP_THRESH):
-                    # 점프 감지 시 이전 값 유지
-                    limited = prev_joint_positions[merged.joint_indices]
-
+            limited = smooth_joint_targets(
+                merged.joint_indices,
+                curr,
+                limited,
+                prev_cmd_map,
+                cmd_alpha,
+            )
             merged = ArticulationAction(
                 joint_indices=merged.joint_indices,
                 joint_positions=limited.astype(np.float32)
             )
             robot.apply_action(merged)
-            prev_joint_positions = curr
+            for dof, pos in zip(merged.joint_indices, merged.joint_positions):
+                prev_cmd_map[int(dof)] = float(pos)
 
         step += 1
 
